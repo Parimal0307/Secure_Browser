@@ -2,29 +2,54 @@
 #include <windows.h>
 #include <string>
 
-// Global hook + TSFN
+// ----------------------------
+// GLOBALS
+// ----------------------------
 HHOOK keyboardHook = NULL;
 Napi::ThreadSafeFunction tsfn;
 
-// Forward declaration
-void SendEvent(const std::string &msg);
+HWND appWindow = NULL;
+bool focusMonitoring = false;
 
-// Keyboard hook procedure
+// ----------------------------
+// SAFE EVENT SENDER
+// ----------------------------
+void SendEvent(const std::string& msg)
+{
+    if (tsfn)
+    {
+        tsfn.BlockingCall(new std::string(msg),
+            [](Napi::Env env, Napi::Function jsCallback, std::string* data)
+            {
+                jsCallback.Call({ Napi::String::New(env, *data) });
+                delete data;
+            });
+    }
+}
+
+// ----------------------------
+// KEYBOARD HOOK
+// ----------------------------
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
     if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN))
     {
-        KBDLLHOOKSTRUCT *p = (KBDLLHOOKSTRUCT *)lParam;
+        KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
 
-        bool isAltPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-        bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool isAltPressed = (GetAsyncKeyState(VK_MENU) & 0x8000);
+        bool isCtrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000);
+        bool isShiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+        bool isWinPressed = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
 
-        // Detect Alt + Tab
+        // ----------------------------
+        // BLOCK SHORTCUTS
+        // ----------------------------
+
+        // Alt + Tab
         if (p->vkCode == VK_TAB && isAltPressed)
         {
             SendEvent("ALT_TAB_BLOCKED");
-            return 1; // BLOCKS the key
+            return 1;
         }
 
         // Alt + Esc
@@ -34,14 +59,14 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             return 1;
         }
 
-        // Alt + F4 (Close window)
+        // Alt + F4 (Close)
         if (p->vkCode == VK_F4 && isAltPressed)
         {
             SendEvent("ALT_F4_BLOCKED");
             return 1;
         }
 
-        // Detect Windows key
+        // Windows key
         if (p->vkCode == VK_LWIN || p->vkCode == VK_RWIN)
         {
             SendEvent("WINDOWS_KEY_BLOCKED");
@@ -55,17 +80,34 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             return 1;
         }
 
-        // Ctrl + Esc (Start Menu)
+        // Ctrl + Esc
         if (p->vkCode == VK_ESCAPE && isCtrlPressed)
         {
             SendEvent("CTRL_ESC_BLOCKED");
             return 1;
         }
+
+        // Win + Down (Minimize)
+        if (p->vkCode == VK_DOWN && isWinPressed)
+        {
+            SendEvent("WIN_MINIMIZE_BLOCKED");
+            return 1;
+        }
+
+        // Alt + Space (System menu)
+        if (p->vkCode == VK_SPACE && isAltPressed)
+        {
+            SendEvent("ALT_SPACE_BLOCKED");
+            return 1;
+        }
     }
+
     return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
 }
 
-// Thread function to run hook loop
+// ----------------------------
+// KEYBOARD HOOK THREAD
+// ----------------------------
 DWORD WINAPI HookThread(LPVOID lpParam)
 {
     keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, NULL, 0);
@@ -79,29 +121,57 @@ DWORD WINAPI HookThread(LPVOID lpParam)
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))
     {
-        // Message loop required for hook to stay alive
+        // Keep hook alive
     }
 
     UnhookWindowsHookEx(keyboardHook);
     return 0;
 }
 
-// Safe bridge: Native thread → JS
-void SendEvent(const std::string &msg)
+// ----------------------------
+// FOCUS MONITOR THREAD (WIN-11)
+// ----------------------------
+DWORD WINAPI FocusMonitorThread(LPVOID lpParam)
 {
-    if (tsfn)
+    focusMonitoring = true;
+
+    while (focusMonitoring)
     {
-        tsfn.BlockingCall(new std::string(msg),
-                          [](Napi::Env env, Napi::Function jsCallback, std::string *data)
-                          {
-                              jsCallback.Call({Napi::String::New(env, *data)});
-                              delete data;
-                          });
+        HWND foreground = GetForegroundWindow();
+
+        if (appWindow != NULL && foreground != appWindow)
+        {
+            SendEvent("FOCUS_LOST");
+        }
+
+        Sleep(500); // check every 0.5 sec
     }
+
+    return 0;
 }
 
-// JS: register callback
-Napi::Value OnKeyEvent(const Napi::CallbackInfo &info)
+// ----------------------------
+// SET APP WINDOW HANDLE
+// ----------------------------
+Napi::Value SetAppWindow(const Napi::CallbackInfo& info)
+{
+    Napi::Env env = info.Env();
+
+    if (!info[0].IsNumber())
+    {
+        Napi::TypeError::New(env, "HWND expected").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    appWindow = (HWND)(uintptr_t)info[0].As<Napi::Number>().Int64Value();
+
+    return env.Null();
+}
+
+// ----------------------------
+// REGISTER JS CALLBACK
+// ----------------------------
+Napi::Value OnKeyEvent(const Napi::CallbackInfo& info)
 {
     Napi::Env env = info.Env();
 
@@ -113,30 +183,40 @@ Napi::Value OnKeyEvent(const Napi::CallbackInfo &info)
 
     tsfn = Napi::ThreadSafeFunction::New(
         env,
-        info[0].As<Napi::Function>(), // JS callback
+        info[0].As<Napi::Function>(),
         "KeyEventCallback",
-        0, // unlimited queue
-        1  // single thread
+        0,
+        1
     );
 
     return env.Null();
 }
 
-// JS: start hook
-Napi::Value StartHook(const Napi::CallbackInfo &info)
+// ----------------------------
+// START HOOKS
+// ----------------------------
+Napi::Value StartHook(const Napi::CallbackInfo& info)
 {
     CreateThread(NULL, 0, HookThread, NULL, 0, NULL);
+
+    // Start focus monitor
+    CreateThread(NULL, 0, FocusMonitorThread, NULL, 0, NULL);
+
     return info.Env().Null();
 }
 
-// JS: stop hook (cleanup)
-Napi::Value StopHook(const Napi::CallbackInfo &info)
+// ----------------------------
+// STOP HOOKS
+// ----------------------------
+Napi::Value StopHook(const Napi::CallbackInfo& info)
 {
     if (keyboardHook)
     {
         UnhookWindowsHookEx(keyboardHook);
         keyboardHook = NULL;
     }
+
+    focusMonitoring = false;
 
     if (tsfn)
     {
@@ -146,12 +226,16 @@ Napi::Value StopHook(const Napi::CallbackInfo &info)
     return info.Env().Null();
 }
 
-// Module export
+// ----------------------------
+// MODULE EXPORT
+// ----------------------------
 Napi::Object Init(Napi::Env env, Napi::Object exports)
 {
     exports.Set("onKeyEvent", Napi::Function::New(env, OnKeyEvent));
     exports.Set("startHook", Napi::Function::New(env, StartHook));
     exports.Set("stopHook", Napi::Function::New(env, StopHook));
+    exports.Set("setAppWindow", Napi::Function::New(env, SetAppWindow));
+
     return exports;
 }
 
