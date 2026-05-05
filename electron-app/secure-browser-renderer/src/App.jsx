@@ -1,11 +1,12 @@
 import React from 'react'
 import './App.css'
+import KeyEventMonitor from './KeyEventMonitor'
 
 const App = () => {
   return (
     <div className='app'>
       <h1>Secure Browser</h1>
-      <p>Try pressing Alt+Tab or Widows key</p>
+      <KeyEventMonitor />
     </div>
   )
 }
